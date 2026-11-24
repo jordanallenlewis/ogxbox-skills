@@ -61,6 +61,12 @@ The helper reads settings from these variables or from `--host`, `--user`, `--pa
 
 The XBMC FileZilla FTP server (banner `XBMC:FileZilla 1.5.6`) ignores a path given to `LIST` and lists the current folder instead. A tool that walks the drive with `LIST /C/foo` never moves, and recurses forever (`/C/C/C/...`). This helper always changes into the folder (`CWD`), checks where it landed (`PWD`), then sends `LIST` with no argument. It never uses `MLSD`. It visits each real folder once and stops at a maximum depth.
 
+## Profiles and a console that goes quiet
+
+XBMC4Gamers keeps its settings per profile. `P:` is the active profile, and FTP can be on in one profile and off in another. `inventory` and `backup` report the active profile, or "unknown" when the helper cannot tell (it never guesses). If FTP stops answering after you switch profile, check that FTP is enabled in that profile.
+
+The FTP server can also disappear across a reboot or a profile switch. The helper does not wait for it: it tries to connect three times (10 seconds each), then exits with code 3 and `Console FTP not reachable: start XBMC4Gamers and enable its FTP server, then re-run.` If the server vanishes in the middle of a walk, the result is marked `incomplete: true`, printed as `INCOMPLETE`, and the exit code is 4. A partial result is never reported as a success.
+
 Drives appear as folders at the FTP root: `/C`, `/D` (DVD), `/E`, `/F` and `/G` (if partitioned), `/P` and `/Q` (XBMC profile and home). The helper checks which exist; a missing drive is not an error.
 
 ## Title IDs
@@ -77,7 +83,7 @@ The bundled list is small because no complete list with a redistribution licence
 
 Designed against XBMC4Gamers installed with Rocky5's Xbox Softmodding Tool, on a v1.6 console with the stock 8 GB HDD. Tests run against a mocked FTP server.
 
-It has not yet been run against a real console. The mock copies the server behaviour described above, but treat the first runs on your own console with care: start with `inventory` and `backup`, and read every plan before you apply it. Reports of what works and what doesn't are welcome as issues.
+This helper has not yet been run against a real console. A separate read-only walk that uses the same method (change into a folder, then `LIST` with no argument) has run against one: it confirmed the server quirk above and that `/C`, `/E`, `/P` and `/Q` are exposed. Which folders sit inside `E:` (`Backups`, `Dashboard` and so on) and how the active profile is named are not confirmed yet. The mock copies the server behaviour described above, but treat the first runs on your own console with care: start with `inventory` and `backup`, and read every plan before you apply it. Reports of what works and what doesn't are welcome as issues.
 
 ## Development
 

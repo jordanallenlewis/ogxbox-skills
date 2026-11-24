@@ -11,6 +11,13 @@ description: 'Free space on a softmodded original Xbox by deleting folders or fi
 - `OGXBOX_HELPER`: the path to `lib/ogxbox_ftp.py` from the ogxbox-skills repository. If it is not set, ask the user where they cloned the repository.
 - Connection settings in the environment: `OGXBOX_HOST` (the console address on the LAN), `OGXBOX_USER`, `OGXBOX_PASS`, and optionally `OGXBOX_PORT`. Many dashboards ship with user `xbox` and password `xbox`; the user may have changed them. Never write the password into a command, a file or the chat. If a variable is missing, ask the user to set it in their shell.
 - The console is on, at its dashboard, with the FTP server enabled.
+- XBMC4Gamers keeps its settings per profile, and FTP can be on in one profile and off in another. The helper reports the active profile (or "unknown"). If FTP stops answering after a profile switch, check that FTP is enabled in that profile.
+
+## If the console does not answer
+
+If the helper exits with `Console FTP not reachable: start XBMC4Gamers and enable its FTP server, then re-run.` (exit code 3), stop. Tell the user that message and nothing else. Do not retry, loop, or try other addresses: the helper has already tried three times, and the server can disappear across a reboot or a profile switch.
+
+If a run ends with `INCOMPLETE` or exit code 4, the console stopped answering partway through. The result is partial: say so first, before anything else you report, and do not use it to decide a change (no add-game or cleanup from a partial list). Tell the user to start XBMC4Gamers, enable its FTP server and re-run.
 
 ## Ground rules
 
