@@ -1,0 +1,5 @@
+# Seed list of original Xbox title IDs. Each row is a fact with its source.
+# See SOURCE.md for where these come from and how to add your own list.
+title_id,name,source
+4d530004,Halo: Combat Evolved,https://xboxdevwiki.net/index.php?title=Xbe&oldid=7427#Title_ID
+45410017,FIFA Soccer 2003,https://xboxdevwiki.net/index.php?title=Xbe&oldid=7427#Title_ID
