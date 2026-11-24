@@ -72,7 +72,7 @@ UNREACHABLE_MESSAGE = ("Console FTP not reachable: start XBMC4Gamers and enable 
                        "then re-run.")
 EXIT_UNREACHABLE = 3
 EXIT_INCOMPLETE = 4
-DEFAULT_MAX_DEPTH = 16
+DEFAULT_MAX_DEPTH = 12  # matches the steward's reference walk (depth > 12 is an error there)
 XBE_HEAD_BYTES = 64 * 1024
 PLAN_FORMAT = "ogxbox-plan-v1"
 
