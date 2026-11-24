@@ -96,6 +96,9 @@ class FakeXboxFTP(object):
         self.free_bytes = None
         self.passive = None
         self.timeout = timeout
+        self.refuse_connect = None   # an exception to raise from connect()
+        self.drop_after_cwds = None  # after this many CWDs the "server" disappears
+        self._cwds = 0
 
     # helpers ---------------------------------------------------------------
 
@@ -136,6 +139,8 @@ class FakeXboxFTP(object):
 
     def connect(self, host, port=21, timeout=None):
         self.log.append("CONNECT")
+        if self.refuse_connect is not None:
+            raise self.refuse_connect
         return BANNER
 
     def login(self, user, passwd):
@@ -149,6 +154,9 @@ class FakeXboxFTP(object):
 
     def cwd(self, path):
         self.log.append("CWD " + path)
+        self._cwds += 1
+        if self.drop_after_cwds is not None and self._cwds > self.drop_after_cwds:
+            raise EOFError("connection closed by the server")
         node, real = self._lookup(self._split(path))
         if not isinstance(node, dict):
             raise ftplib.error_perm("550 CWD failed. \"%s\": directory not found." % path)

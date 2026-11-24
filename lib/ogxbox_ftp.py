@@ -29,8 +29,10 @@ import hashlib
 import json
 import os
 import re
+import socket
 import stat
 import struct
+import xml.etree.ElementTree as ET
 import sys
 import time
 
@@ -61,6 +63,15 @@ FATX_MAX_FILE = 4294967295  # 2**32 - 1, the largest value a 4-byte size holds
 FATX_EXTRA_CHARS = set(" !#$%&'()-.@[]^_`{}~")
 
 DEFAULT_TIMEOUT = 30
+# The console's FTP server can vanish across a reboot or a profile switch.
+# Connecting is bounded: a short timeout, then at most two more tries.
+CONNECT_TIMEOUT = 10
+CONNECT_RETRIES = 2
+CONNECT_RETRY_DELAY = 1.0
+UNREACHABLE_MESSAGE = ("Console FTP not reachable: start XBMC4Gamers and enable its FTP server, "
+                       "then re-run.")
+EXIT_UNREACHABLE = 3
+EXIT_INCOMPLETE = 4
 DEFAULT_MAX_DEPTH = 16
 XBE_HEAD_BYTES = 64 * 1024
 PLAN_FORMAT = "ogxbox-plan-v1"
@@ -72,6 +83,12 @@ SENSITIVE_NAMES = {"eeprom.bin", "xbox info.txt"}
 # Paths that cleanup never deletes, whatever the user asks. Lower case, FTP
 # form. A path is protected when it is one of these, sits inside one, or is a
 # parent of one.
+# What a real console has confirmed so far (steward's read-only walk of a
+# console running XBMC4Gamers, 2026-11-24): /C, /E, /P and /Q exist as
+# top-level folders, so "/P" and "/Q" below are CONFIRMED to be real paths.
+# NOT confirmed: /E/Backups, /E/Dashboard, /E/Dashboards, /E/XBMC4Gamers and
+# the nkpatcher folder name. They stay on the list because protecting a
+# folder that is not there costs nothing.
 NEVER_DELETE = [
     "/C",                 # system drive: never written at all
     "/E/Backups",         # EEPROM and softmod backups
@@ -96,6 +113,20 @@ class OgxError(Exception):
 
 class SafetyError(OgxError):
     """A refused operation: unsafe path, protected path, no approval."""
+
+
+class ConsoleUnreachable(OgxError):
+    """The FTP server did not answer after the bounded tries."""
+
+
+class ConnectionLost(OgxError):
+    """The server went away in the middle of a read. Whatever was collected
+    so far is partial and must be reported as incomplete."""
+
+
+# What a vanished server looks like to ftplib. Local file errors are not in
+# this list on purpose: a full disk is not a lost console.
+_DROPPED = (EOFError, ConnectionError, socket.timeout)
 
 
 # --------------------------------------------------------------------------
@@ -289,7 +320,10 @@ def parse_list_line(line):
 # --------------------------------------------------------------------------
 
 class Settings(object):
-    def __init__(self, host, user, password, port=21, timeout=DEFAULT_TIMEOUT, passive=True):
+    def __init__(self, host, user, password, port=21, timeout=DEFAULT_TIMEOUT, passive=True,
+                 connect_retries=CONNECT_RETRIES, retry_delay=CONNECT_RETRY_DELAY):
+        self.connect_retries = connect_retries
+        self.retry_delay = retry_delay
         self.host = host
         self.user = user
         self._password = password
@@ -344,23 +378,39 @@ class XboxFTP(object):
         self.ftp = None
         self.banner = ""
         self.warnings = []
+        self.incomplete = False  # set when the server dropped mid-read
         self._log = log or (lambda msg: None)
         self._busy = False
 
     # connection -----------------------------------------------------------
 
     def connect(self):
+        """Connect and log in. Bounded: CONNECT_TIMEOUT per try and at most
+        `connect_retries` more tries, then ConsoleUnreachable. A refused
+        login is never retried."""
         s = self.settings
-        self.ftp = self._factory(timeout=s.timeout)
-        try:
-            self.banner = self.ftp.connect(s.host, s.port, timeout=s.timeout) or ""
-            self.ftp.login(s.user, s.password)
-        except ftplib.error_perm:
-            raise OgxError("login refused: check OGXBOX_USER and OGXBOX_PASS")
-        except (OSError, EOFError, ftplib.Error) as exc:
-            raise OgxError("could not connect to the console FTP server: %s" % type(exc).__name__)
-        self.ftp.set_pasv(s.passive)
-        return self
+        tries = 1 + max(0, s.connect_retries)
+        wait = min(s.timeout, CONNECT_TIMEOUT)
+        for attempt in range(tries):
+            self.ftp = None
+            try:
+                self.ftp = self._factory(timeout=wait)
+                self.banner = self.ftp.connect(s.host, s.port, timeout=wait) or ""
+                self.ftp.login(s.user, s.password)
+            except ftplib.error_perm:
+                raise OgxError("login refused: check OGXBOX_USER and OGXBOX_PASS")
+            except (OSError, EOFError, ftplib.Error) as exc:
+                self._log("connect try %d of %d failed: %s" % (attempt + 1, tries, type(exc).__name__))
+                self.close()
+                if attempt + 1 < tries and s.retry_delay:
+                    time.sleep(s.retry_delay)
+                continue
+            sock = getattr(self.ftp, "sock", None)
+            if sock is not None:
+                sock.settimeout(s.timeout)  # the short timeout was for connecting only
+            self.ftp.set_pasv(s.passive)
+            return self
+        raise ConsoleUnreachable(UNREACHABLE_MESSAGE)
 
     def close(self):
         if self.ftp is not None:
@@ -384,6 +434,21 @@ class XboxFTP(object):
         self._log("warning: " + msg)
 
     @contextlib.contextmanager
+    def _net(self, what):
+        """Turn a vanished server into ConnectionLost and remember it."""
+        try:
+            yield
+        except _DROPPED as exc:
+            self.incomplete = True
+            raise ConnectionLost("the console stopped answering while %s (%s)"
+                                 % (what, type(exc).__name__))
+        except ftplib.error_temp as exc:
+            if str(exc).startswith("421"):
+                self.incomplete = True
+                raise ConnectionLost("the console closed the connection while %s" % what)
+            raise
+
+    @contextlib.contextmanager
     def _one_op(self):
         """One write at a time: a second write while one runs is refused."""
         if self._busy:
@@ -400,8 +465,9 @@ class XboxFTP(object):
         """CWD into `path` and confirm with PWD. Returns the PWD path.
         Raises ftplib.error_perm if the folder does not exist."""
         path = to_remote(path)
-        self.ftp.cwd(path)
-        here = self.ftp.pwd()
+        with self._net("opening %s" % path):
+            self.ftp.cwd(path)
+            here = self.ftp.pwd()
         try:
             here_n = to_remote(here) if here not in ("", "/") else "/"
         except SafetyError:
@@ -414,7 +480,8 @@ class XboxFTP(object):
         """Entries of one folder. CWD first, then LIST with no argument."""
         here = self.cd(path)
         lines = []
-        self.ftp.retrlines("LIST", lines.append)
+        with self._net("listing %s" % here):
+            self.ftp.retrlines("LIST", lines.append)
         entries = []
         for line in lines:
             e = parse_list_line(line)
@@ -452,6 +519,9 @@ class XboxFTP(object):
                 found.append(letter)
             except ftplib.error_perm:
                 pass  # a drive the server does not expose is not an error
+            except ConnectionLost as exc:
+                self.warn("%s; the drive list is partial" % exc)
+                break
             except OgxError as exc:
                 self.warn(str(exc))
         return found
@@ -472,6 +542,9 @@ class XboxFTP(object):
             except ftplib.error_perm as exc:
                 self.warn("cannot open %s (%s)" % (path, str(exc)[:40]))
                 continue
+            except ConnectionLost as exc:
+                self.warn("%s; the walk stops here and is incomplete" % exc)
+                return
             except OgxError as exc:
                 self.warn("%s; skipping that branch" % exc)
                 continue
@@ -510,24 +583,26 @@ class XboxFTP(object):
         """Download one file in binary mode, passing chunks to `write`."""
         remote = to_remote(remote)
         self.cd(remote_parent(remote))
-        self._binary()
-        self.ftp.retrbinary("RETR " + remote_name(remote), write)
+        with self._net("downloading %s" % remote):
+            self._binary()
+            self.ftp.retrbinary("RETR " + remote_name(remote), write)
 
     def read_head(self, remote, nbytes=XBE_HEAD_BYTES):
         """The first `nbytes` of a remote file, without fetching all of it."""
         remote = to_remote(remote)
         self.cd(remote_parent(remote))
-        self._binary()
-        conn = self.ftp.transfercmd("RETR " + remote_name(remote))
         buf = b""
-        try:
-            while len(buf) < nbytes:
-                chunk = conn.recv(min(8192, nbytes - len(buf)))
-                if not chunk:
-                    break
-                buf += chunk
-        finally:
-            conn.close()
+        with self._net("reading %s" % remote):
+            self._binary()
+            conn = self.ftp.transfercmd("RETR " + remote_name(remote))
+            try:
+                while len(buf) < nbytes:
+                    chunk = conn.recv(min(8192, nbytes - len(buf)))
+                    if not chunk:
+                        break
+                    buf += chunk
+            finally:
+                conn.close()
         try:
             self.ftp.voidresp()  # 226 if complete, 426 if we stopped early
         except (ftplib.error_temp, ftplib.error_perm, ftplib.error_reply):
@@ -743,6 +818,8 @@ def installed_games(client, drives=None, read_xbe=True, max_depth=GAME_SEARCH_DE
         root = "/%s/games" % d
         try:
             client.cd(root)
+        except ConnectionLost:
+            raise
         except (ftplib.error_perm, OgxError):
             continue
         stack = [(root, 0)]
@@ -751,6 +828,8 @@ def installed_games(client, drives=None, read_xbe=True, max_depth=GAME_SEARCH_DE
             parent, depth = stack.pop()
             try:
                 here, entries = client.list_dir(parent)
+            except ConnectionLost:
+                raise
             except (ftplib.error_perm, OgxError) as exc:
                 client.warn("cannot open %s: %s" % (parent, exc))
                 continue
@@ -772,6 +851,8 @@ def installed_games(client, drives=None, read_xbe=True, max_depth=GAME_SEARCH_DE
                 try:
                     info = parse_xbe(client.read_head(remote_join(path, xbe["name"])))
                     game.update(info)
+                except ConnectionLost:
+                    raise
                 except (OgxError, ftplib.Error, OSError) as exc:
                     client.warn("could not read the title ID of %s: %s" % (path, exc))
             games.append(game)
@@ -789,11 +870,72 @@ def installed_title_ids(client):
     return sorted({g["title_id"] for g in games if g.get("title_id")}), complete
 
 
+PROFILE_LIST_FILE = "/Q/UserData/profiles.xml"
+
+
+def active_profile(client):
+    """The name of the active XBMC4Gamers profile, or "unknown".
+
+    XBMC4Gamers keeps its settings per profile and `P:` is the active one, so
+    FTP can be on in one profile and off in another. Nothing in P: itself
+    carries the name, so this reads the profile list (Q:\\UserData\\profiles.xml),
+    takes the profile marked `lastloaded`, and accepts it only if that
+    profile's folder holds the same top-level names as /P. Any doubt
+    (no file, no match, odd XML) gives "unknown". It never guesses.
+
+    UNCONFIRMED on a real console: the file location and layout follow
+    XBMC's documented format, and the walk reference seen so far only
+    confirms that /P and /Q exist as top-level folders."""
+    try:
+        data = client.read_head(PROFILE_LIST_FILE, 64 * 1024)
+        if not data or b"<!DOCTYPE" in data or b"<!ENTITY" in data:
+            return "unknown"
+        root = ET.fromstring(data)
+        last = int((root.findtext("lastloaded") or "").strip())
+        profiles = root.findall("profile")
+        if not 0 <= last < len(profiles):
+            return "unknown"
+        name = (profiles[last].findtext("name") or "").strip()
+        folder = (profiles[last].findtext("directory") or "").strip().replace("\\", "/")
+        if not name or not folder:
+            return "unknown"
+        if folder.startswith("/") or ":" in folder:
+            return "unknown"  # a full path on the console's own drive letters: not mapped here
+        _, mine = client.list_dir("/P")
+        _, theirs = client.list_dir("/Q/UserData/" + folder.strip("/"))
+    except ConnectionLost:
+        raise
+    except (OgxError, ftplib.Error, OSError, ET.ParseError, ValueError):
+        return "unknown"
+    names = lambda es: sorted(e["name"].lower() for e in es)
+    if names(mine) and names(mine) == names(theirs):
+        return name
+    return "unknown"
+
+
 def inventory(client, max_depth=DEFAULT_MAX_DEPTH, read_xbe=True, titles=None):
+    """Read-only report. If the console drops mid-walk the report keeps what
+    was read and says `incomplete: true`; it is never presented as whole."""
     titles = load_title_ids() if titles is None else titles
+    report = {"banner": client.banner.strip(), "drives": [], "profile": "unknown", "folders": [],
+              "games": [], "apps": [], "saves": [], "tdata": [], "caches": [], "notes": [],
+              "incomplete": False}
+    try:
+        _fill_inventory(client, report, max_depth, read_xbe, titles)
+    except ConnectionLost as exc:
+        report["notes"].append(str(exc))
+    report["incomplete"] = client.incomplete
+    if client.incomplete:
+        report["notes"].append("INCOMPLETE: the console stopped answering during the walk, so this "
+                               "list is partial. " + UNREACHABLE_MESSAGE)
+    report["warnings"] = list(client.warnings)
+    return report
+
+
+def _fill_inventory(client, report, max_depth, read_xbe, titles):
     drives = client.probe_drives()
-    report = {"banner": client.banner.strip(), "drives": drives, "folders": [],
-              "games": [], "apps": [], "saves": [], "tdata": [], "caches": [], "notes": []}
+    report["drives"] = drives
+    report["profile"] = active_profile(client)
     all_sizes = {}
     for d in drives:
         if d in ("C", "D"):
@@ -856,8 +998,6 @@ def inventory(client, max_depth=DEFAULT_MAX_DEPTH, read_xbe=True, titles=None):
             except OgxError:
                 pass
             report["saves" if kind == "UDATA" else "tdata"].append(item)
-    report["warnings"] = list(client.warnings)
-    return report
 
 
 # --------------------------------------------------------------------------
@@ -867,6 +1007,8 @@ def inventory(client, max_depth=DEFAULT_MAX_DEPTH, read_xbe=True, titles=None):
 DEFAULT_BACKUP_SOURCES = [
     ("eeprom", "/E/Backups/EEPROM"),
     ("saves", "/E/UDATA"),
+    # /P is confirmed to exist on a real console. It is the ACTIVE profile's
+    # folder (settings are per profile), so this copies one profile.
     ("dashboard-profile", "/P"),
 ]
 
@@ -908,7 +1050,8 @@ def backup(client, dest, sources=None, max_depth=DEFAULT_MAX_DEPTH):
     """Copy the console's irreplaceable files to `dest`. Contents are never
     printed. The folder is 0700 and every file 0600."""
     dest = os.path.abspath(dest)
-    report = {"dest": dest, "copied": [], "skipped": [], "warnings": [], "errors": []}
+    report = {"dest": dest, "copied": [], "skipped": [], "warnings": [], "errors": [],
+              "profile": "unknown"}
     lower = dest.lower()
     if any(h in lower for h in CLOUD_HINTS):
         report["warnings"].append("this folder looks cloud-synced; keep EEPROM backups off cloud sync")
@@ -927,7 +1070,28 @@ def backup(client, dest, sources=None, max_depth=DEFAULT_MAX_DEPTH):
     _private_dir(root)
     with _private_file(os.path.join(root, ".gitignore")) as fh:
         fh.write(b"# EEPROM and console info files hold your hard drive key. Never commit them.\n*\n")
-    for label, src in sources or DEFAULT_BACKUP_SOURCES:
+    try:
+        _backup_sources(client, root, report, sources or DEFAULT_BACKUP_SOURCES, max_depth)
+    except ConnectionLost as exc:
+        report["errors"].append({"remote": "(connection)", "error": str(exc)})
+    for d, dirs, files in os.walk(root):
+        os.chmod(d, 0o700)
+        for f in files:
+            os.chmod(os.path.join(d, f), 0o600)
+    report["root"] = root
+    report["incomplete"] = client.incomplete
+    report["warnings"].extend(client.warnings)
+    if client.incomplete:
+        report["warnings"].append("INCOMPLETE: the console stopped answering, so this backup is "
+                                  "partial. " + UNREACHABLE_MESSAGE)
+    return report
+
+
+def _backup_sources(client, root, report, sources, max_depth):
+    # /P holds the ACTIVE profile's settings only (they are per profile), so
+    # say which profile this backup captured.
+    report["profile"] = active_profile(client)
+    for label, src in sources:
         src = to_remote(src)
         if not client.exists_dir(src):
             report["skipped"].append({"source": src, "why": "not found on the console"})
@@ -944,6 +1108,9 @@ def backup(client, dest, sources=None, max_depth=DEFAULT_MAX_DEPTH):
                 try:
                     with _private_file(local) as fh:
                         client.download(remote, fh.write)
+                except ConnectionLost:
+                    report["errors"].append({"remote": remote, "error": "connection lost"})
+                    raise
                 except (ftplib.Error, OSError, OgxError) as exc:
                     report["errors"].append({"remote": remote, "error": type(exc).__name__})
                     continue
@@ -954,13 +1121,6 @@ def backup(client, dest, sources=None, max_depth=DEFAULT_MAX_DEPTH):
                     report["errors"].append({"remote": remote,
                                              "error": "size mismatch: %d on console, %d copied" % (e["size"], got)})
                 report["copied"].append(item)
-    for d, dirs, files in os.walk(root):
-        os.chmod(d, 0o700)
-        for f in files:
-            os.chmod(os.path.join(d, f), 0o600)
-    report["root"] = root
-    report["warnings"].extend(client.warnings)
-    return report
 
 
 # --------------------------------------------------------------------------
@@ -1197,7 +1357,10 @@ def table(rows, headers):
 
 
 def print_inventory(rep):
+    if rep.get("incomplete"):
+        print("INCOMPLETE: the console stopped answering; this list is partial.\n")
     print("Drives: %s" % (" ".join(rep["drives"]) or "none"))
+    print("Active profile: %s" % rep.get("profile", "unknown"))
     if rep["games"]:
         print("\nGames")
         print(table([(g.get("title_name") or g["folder"], g.get("title_id") or "?", human_bytes(g.get("bytes")),
@@ -1350,7 +1513,7 @@ def main(argv=None, ftp_factory=None, environ=None):
         settings = Settings.from_args(args, environ)
         with XboxFTP(settings, ftp_factory=ftp_factory, log=log) as c:
             if args.cmd == "probe":
-                _emit(args, {"banner": c.banner.strip(), "drives": c.probe_drives()},
+                _emit(args, {"banner": c.banner.strip(), "drives": c.probe_drives(), "incomplete": c.incomplete},
                       lambda d: print("Server: %s\nDrives: %s" % (d["banner"], " ".join(d["drives"]))))
             elif args.cmd == "ls":
                 here, entries = c.list_dir(args.path)
@@ -1373,6 +1536,8 @@ def main(argv=None, ftp_factory=None, environ=None):
                     print(table([(x["remote"], x["bytes"], "yes" if x["verified"] else "NO",
                                   "sensitive" if x["sensitive"] else "") for x in r["copied"]],
                                 ["Remote", "Bytes", "Verified", ""]))
+                    print("Active profile (the dashboard-profile copy is this one only): %s"
+                          % r.get("profile", "unknown"))
                     for s in r["skipped"]:
                         print("skipped %s: %s" % (s["source"], s["why"]))
                     for w in r["warnings"]:
@@ -1382,7 +1547,7 @@ def main(argv=None, ftp_factory=None, environ=None):
                     print("eeprom.bin and 'xbox info.txt' hold your hard drive key: keep this folder "
                           "off cloud sync and out of git.")
                 _emit(args, rep, human)
-                return 1 if rep["errors"] else 0
+                return EXIT_INCOMPLETE if rep["incomplete"] else (1 if rep["errors"] else 0)
             elif args.cmd in ("plan-add-game", "plan-cleanup"):
                 if args.cmd == "plan-add-game":
                     plan = plan_add_game(c, args.local_dir, args.drive, args.title)
@@ -1399,7 +1564,17 @@ def main(argv=None, ftp_factory=None, environ=None):
                 finally:
                     os.unlink(lock)
                 _emit(args, res, lambda r: print("Applied and verified %d operation(s)." % r["applied"]))
+            if c.incomplete:
+                print("INCOMPLETE: the console stopped answering; the result above is partial. "
+                      + UNREACHABLE_MESSAGE, file=sys.stderr)
+                return EXIT_INCOMPLETE
         return 0
+    except ConsoleUnreachable as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return EXIT_UNREACHABLE
+    except ConnectionLost as exc:
+        print("error: %s. %s" % (exc, UNREACHABLE_MESSAGE), file=sys.stderr)
+        return EXIT_INCOMPLETE
     except SafetyError as exc:
         print("refused: %s" % exc, file=sys.stderr)
         return 2

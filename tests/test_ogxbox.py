@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "lib"))
@@ -18,6 +19,7 @@ sys.path.insert(0, HERE)
 
 import ogxbox_ftp as ox  # noqa: E402
 from fake_xbox import FakeXboxFTP, factory, make_xbe  # noqa: E402
+from fake_xbox import default_fs as ox_default_fs  # noqa: E402
 
 ENV = {"OGXBOX_HOST": "console.example", "OGXBOX_USER": "xbox", "OGXBOX_PASS": "xbox"}
 LOCK_DIR = tempfile.mkdtemp(prefix="ogxbox-locks-")
@@ -747,3 +749,156 @@ class ReviewFindings(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+PROFILES_XML = (b"<profiles><lastloaded>1</lastloaded>"
+                b"<profile><name>Master user</name><directory>profiles\\master</directory></profile>"
+                b"<profile><name>Retro</name><directory>profiles\\retro</directory></profile></profiles>")
+
+
+class Unreachable(unittest.TestCase):
+    """The FTP server can vanish across a reboot or a profile switch."""
+
+    def run_refused(self, argv):
+        fake = FakeXboxFTP()
+        fake.refuse_connect = ConnectionRefusedError(111, "refused")
+        with mock.patch.object(ox.time, "sleep") as sleep:
+            code, out, err = run_main(argv, fake)
+        return fake, code, out, err, sleep
+
+    def test_connect_refused_is_bounded_and_says_what_to_do(self):
+        fake, code, out, err, sleep = self.run_refused(["inventory"])
+        self.assertEqual(code, ox.EXIT_UNREACHABLE)
+        self.assertNotEqual(code, 0)
+        self.assertIn("Console FTP not reachable: start XBMC4Gamers and enable its FTP server, "
+                      "then re-run.", err)
+        self.assertEqual(fake.log.count("CONNECT"), 3)  # one try and two retries, then stop
+        self.assertLessEqual(sleep.call_count, 2)
+        self.assertEqual(out, "")
+
+    def test_connect_uses_the_short_timeout(self):
+        fake, *_ = self.run_refused(["--timeout", "300", "probe"])
+        self.assertEqual(fake.timeout, ox.CONNECT_TIMEOUT)
+
+    def test_every_command_gives_the_same_answer(self):
+        for argv in (["probe"], ["ls", "/E"], ["backup", tempfile.mkdtemp()]):
+            _, code, _, err, _ = self.run_refused(argv)
+            self.assertEqual(code, ox.EXIT_UNREACHABLE, argv)
+            self.assertIn("Console FTP not reachable", err)
+
+    def test_a_server_that_comes_back_on_the_second_try_works(self):
+        fake = FakeXboxFTP()
+        calls = []
+        real = fake.connect
+
+        def flaky(host, port=21, timeout=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise ConnectionRefusedError(111, "refused")
+            return real(host, port, timeout)
+        fake.connect = flaky
+        with mock.patch.object(ox.time, "sleep"):
+            code, out, err = run_main(["probe"], fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 2)
+
+    def test_wrong_password_is_not_retried(self):
+        fake = FakeXboxFTP(password="other")
+        with mock.patch.object(ox.time, "sleep") as sleep:
+            code, out, err = run_main(["probe"], fake)
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.log.count("CONNECT"), 1)
+        sleep.assert_not_called()
+        self.assertIn("login refused", err)
+
+
+class DroppedMidWalk(unittest.TestCase):
+    def test_inventory_is_partial_and_says_so(self):
+        fake = FakeXboxFTP()
+        fake.drop_after_cwds = 14
+        code, out, err = run_main(["--json", "inventory"], fake)
+        report = json.loads(out)
+        self.assertIs(report["incomplete"], True)
+        self.assertEqual(code, ox.EXIT_INCOMPLETE)
+        self.assertIn("INCOMPLETE", " ".join(report["notes"]))
+        self.assertIn("Console FTP not reachable", " ".join(report["notes"]))
+
+    def test_human_output_leads_with_incomplete(self):
+        fake = FakeXboxFTP()
+        fake.drop_after_cwds = 14
+        code, out, err = run_main(["inventory"], fake)
+        self.assertTrue(out.startswith("INCOMPLETE"))
+        self.assertNotEqual(code, 0)
+
+    def test_a_complete_walk_is_not_flagged(self):
+        code, out, err = run_main(["--json", "inventory"], FakeXboxFTP())
+        self.assertEqual(code, 0)
+        self.assertIs(json.loads(out)["incomplete"], False)
+
+    def test_drop_during_the_drive_probe_is_partial_too(self):
+        fake = FakeXboxFTP()
+        fake.drop_after_cwds = 2
+        code, out, err = run_main(["--json", "inventory"], fake)
+        self.assertEqual(code, ox.EXIT_INCOMPLETE)
+        self.assertIs(json.loads(out)["incomplete"], True)
+
+    def test_backup_stops_and_is_flagged(self):
+        fake = FakeXboxFTP()
+        fake.drop_after_cwds = 6
+        dest = tempfile.mkdtemp()
+        code, out, err = run_main(["--json", "backup", dest], fake)
+        rep = json.loads(out)
+        self.assertEqual(code, ox.EXIT_INCOMPLETE)
+        self.assertIs(rep["incomplete"], True)
+
+    def test_a_cleanup_plan_is_never_written_from_a_partial_walk(self):
+        fake = FakeXboxFTP()
+        fake.drop_after_cwds = 8
+        out_file = os.path.join(tempfile.mkdtemp(), "plan.json")
+        code, out, err = run_main(["--json", "plan-cleanup", "/E/games/Halo Combat Evolved",
+                                   "--out", out_file], fake)
+        if os.path.exists(out_file):
+            plan = json.load(open(out_file))
+            self.assertEqual([o for o in plan["ops"] if o["op"] != "mkdir"], [])
+
+
+class ActiveProfile(unittest.TestCase):
+    def fs(self, xml=PROFILES_XML, retro=None):
+        fs = ox_default_fs()
+        fs["Q"]["UserData"] = {"profiles.xml": xml,
+                               "profiles": {"master": {"guisettings.xml": b"m"},
+                                            "retro": retro if retro is not None
+                                            else {"guisettings.xml": b"r"}}}
+        return fs
+
+    def test_names_the_profile_when_p_matches_its_folder(self):
+        c = client_for(FakeXboxFTP(self.fs()))
+        self.assertEqual(ox.active_profile(c), "Retro")
+
+    def test_unknown_when_there_is_no_profile_list(self):
+        c = client_for(FakeXboxFTP())
+        self.assertEqual(ox.active_profile(c), "unknown")
+
+    def test_unknown_when_p_does_not_match(self):
+        c = client_for(FakeXboxFTP(self.fs(retro={"other.xml": b"x"})))
+        self.assertEqual(ox.active_profile(c), "unknown")
+
+    def test_unknown_on_broken_or_hostile_xml(self):
+        for xml in (b"not xml", b"<!DOCTYPE x [<!ENTITY a 'b'>]><profiles/>",
+                    b"<profiles><lastloaded>9</lastloaded></profiles>"):
+            c = client_for(FakeXboxFTP(self.fs(xml)))
+            self.assertEqual(ox.active_profile(c), "unknown", xml)
+
+    def test_inventory_reports_it(self):
+        rep = ox.inventory(client_for(FakeXboxFTP(self.fs())), titles={})
+        self.assertEqual(rep["profile"], "Retro")
+        rep = ox.inventory(client_for(FakeXboxFTP()), titles={})
+        self.assertEqual(rep["profile"], "unknown")
+        code, out, err = run_main(["inventory"], FakeXboxFTP())
+        self.assertIn("Active profile: unknown", out)
+
+    def test_backup_names_the_profile_it_copied(self):
+        rep = ox.backup(client_for(FakeXboxFTP(self.fs())), tempfile.mkdtemp())
+        self.assertEqual(rep["profile"], "Retro")
+        rep = ox.backup(client_for(FakeXboxFTP()), tempfile.mkdtemp())
+        self.assertEqual(rep["profile"], "unknown")
