@@ -20,6 +20,8 @@ import ogxbox_ftp as ox  # noqa: E402
 from fake_xbox import FakeXboxFTP, factory, make_xbe  # noqa: E402
 
 ENV = {"OGXBOX_HOST": "console.example", "OGXBOX_USER": "xbox", "OGXBOX_PASS": "xbox"}
+LOCK_DIR = tempfile.mkdtemp(prefix="ogxbox-locks-")
+os.environ["OGXBOX_LOCK_DIR"] = LOCK_DIR
 
 
 def client_for(fake):
@@ -219,6 +221,39 @@ class WriteSafety(unittest.TestCase):
                     fn()
         self.assertEqual(fake.writes, [])
 
+    def test_no_writes_inside_protected_folders(self):
+        fake = FakeXboxFTP()
+        c = client_for(fake)
+        with tempfile.NamedTemporaryFile() as fh:
+            for fn in (lambda: c.upload(fh.name, "/E/Backups/EEPROM/eeprom.bin"),
+                       lambda: c.upload(fh.name, "/e/backups/new.bin"),
+                       lambda: c.mkdir("/E/NKPatcher/x"),
+                       lambda: c.mkdir("/E/Dashboards/XBMC4Gamers/skin")):
+                with self.assertRaises(ox.SafetyError):
+                    fn()
+        self.assertEqual(fake.writes, [])
+
+    def test_upload_never_overwrites(self):
+        fake = FakeXboxFTP()
+        c = client_for(fake)
+        with tempfile.NamedTemporaryFile() as fh:
+            with self.assertRaises(ox.SafetyError):
+                c.upload(fh.name, "/E/games/Halo Combat Evolved/default.xbe")
+        self.assertEqual(fake.writes, [])
+
+    def test_forged_add_game_plan_refused(self):
+        fake = FakeXboxFTP()
+        c = client_for(fake)
+        with tempfile.NamedTemporaryFile() as fh:
+            for ops in ([{"op": "upload", "local": fh.name, "remote": "/E/Backups/EEPROM/eeprom.bin", "bytes": 0}],
+                        [{"op": "upload", "local": fh.name, "remote": "/E/apps/x.bin", "bytes": 0}],
+                        [{"op": "delete", "remote": "/E/games/Not A Game/readme.txt", "bytes": 5}]):
+                plan = {"format": ox.PLAN_FORMAT, "kind": "add-game", "ops": ops, "violations": [],
+                        "free_space_known": True, "total_bytes": 0}
+                with self.assertRaises(ox.SafetyError, msg=str(ops)):
+                    ox.apply_plan(c, plan, ox.plan_hash(plan), yes=True)
+        self.assertEqual(fake.writes, [])
+
     def test_one_operation_at_a_time(self):
         fake = FakeXboxFTP()
         c = client_for(fake)
@@ -326,7 +361,7 @@ class AddGame(unittest.TestCase):
             code, out, err = run_main(["apply", planfile, "--approve", h, "--yes", "--free-space-ok"], fake)
             self.assertEqual(code, 0, err)
             self.assertIn("verified 4", out)
-            self.assertFalse(os.path.exists(planfile + ".lock"))
+            self.assertEqual(os.listdir(LOCK_DIR), [], "the lock is released")
 
     def test_edited_plan_fails_hash(self):
         fake = FakeXboxFTP()
@@ -580,7 +615,8 @@ class Credentials(unittest.TestCase):
         self.assertNotIn("wrong-pass-value", out + err)
 
     def test_no_credentials_in_source(self):
-        src = open(os.path.join(HERE, "..", "lib", "ogxbox_ftp.py")).read()
+        with open(os.path.join(HERE, "..", "lib", "ogxbox_ftp.py")) as fh:
+            src = fh.read()
         self.assertNotIn('password="xbox"', src)
         self.assertNotIn("password='xbox'", src)
 
@@ -601,6 +637,112 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Halo", out)
         self.assertIn("/E/UDATA/4d530064", out)
+
+
+class ReviewFindings(unittest.TestCase):
+    """One test per defect found in review; each failed before its fix."""
+
+    def test_wildcards_and_trailing_dots_refused(self):
+        for p in ("/E/Backups.", "/E/nkp*", "/E/games/a?", "/E/games/x ", "/E/UDATA/*"):
+            with self.assertRaises(ox.SafetyError, msg=p):
+                ox.guard_delete(p)
+
+    def test_unreadable_title_id_blocks_save_deletes(self):
+        fake = FakeXboxFTP()
+        fake.fs["E"]["games"]["Halo Combat Evolved"]["default.xbe"] = b"corrupt"
+        c = client_for(fake)
+        plan = ox.plan_cleanup(c, ["/E/UDATA/4d530004", "/E/TDATA/4d530064", "/E/games/Not A Game"])
+        refused = [r["path"] for r in plan["refused"]]
+        self.assertEqual(refused, ["/E/UDATA/4d530004", "/E/TDATA/4d530064"])
+        self.assertTrue(all(o["remote"].startswith("/E/games/") for o in plan["ops"]))
+
+    def test_nested_category_games_are_found(self):
+        fake = FakeXboxFTP()
+        halo = fake.fs["E"]["games"].pop("Halo Combat Evolved")
+        fake.fs["E"]["games"]["Shooters"] = {"Halo Combat Evolved": halo}
+        c = client_for(fake)
+        games = ox.installed_games(c)
+        self.assertEqual([g["path"] for g in games], ["/E/games/Shooters/Halo Combat Evolved"])
+        plan = ox.plan_cleanup(c, ["/E/UDATA/4d530004"])
+        self.assertEqual(plan["ops"], [])
+
+    def test_case_duplicates_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            g = make_game(d)
+            with open(os.path.join(g, "DEFAULT.XBE"), "wb") as fh:
+                fh.write(b"x")
+            v = ox.check_fatx_tree(g)
+        self.assertTrue(any("apart from case" in x["problem"] for x in v), v)
+
+    def test_apply_rechecks_fatx_on_edited_plan(self):
+        fake = FakeXboxFTP()
+        c = client_for(fake)
+        with tempfile.TemporaryDirectory() as d:
+            g = make_game(d)
+            plan = ox.plan_add_game(c, g, "E")
+            plan["ops"][-1]["remote"] = "/E/games/My Game/" + "n" * 50
+            with self.assertRaises(ox.SafetyError):
+                ox.apply_plan(c, plan, ox.plan_hash(plan), yes=True, free_space_ok=True)
+            plan = ox.plan_add_game(c, g, "E")
+            plan["ops"][-1]["remote"] = "/E/games/Other Game/x.bin"
+            with self.assertRaises(ox.SafetyError):
+                ox.apply_plan(c, plan, ox.plan_hash(plan), yes=True, free_space_ok=True)
+        self.assertEqual(fake.writes, [])
+
+    def test_delete_in_plan_of_other_kind_refused(self):
+        fake = FakeXboxFTP()
+        c = client_for(fake)
+        plan = {"format": ox.PLAN_FORMAT, "kind": "x", "protected_titles": [], "violations": [],
+                "ops": [{"op": "delete", "remote": "/E/UDATA/4d530004/save one/SaveMeta.xbx"}]}
+        with self.assertRaises(ox.SafetyError):
+            ox.apply_plan(c, plan, ox.plan_hash(plan), yes=True)
+        self.assertEqual(fake.writes, [])
+
+    def test_one_apply_per_console(self):
+        fake = FakeXboxFTP()
+        with tempfile.TemporaryDirectory() as d:
+            g = make_game(d)
+            planfile = os.path.join(d, "plan.json")
+            run_main(["plan-add-game", g, "--out", planfile], fake)
+            h = ox.plan_hash(ox.read_plan(planfile))
+            lock = ox._lock(ox.Settings("console.example", "xbox", "xbox"))
+            try:
+                code, _, err = run_main(["apply", planfile, "--approve", h, "--yes", "--free-space-ok"], fake)
+            finally:
+                os.unlink(lock)
+        self.assertEqual(code, 2)
+        self.assertIn("another apply", err)
+        self.assertEqual(fake.writes, [])
+
+    def test_protected_folder_inside_target_refused_at_plan(self):
+        fake = FakeXboxFTP()
+        fake.fs["E"]["UDATA"]["4d530064"]["nkpatcher settings"] = {"a.ini": b"x"}
+        c = client_for(fake)
+        plan = ox.plan_cleanup(c, ["/E/UDATA/4d530064"])
+        self.assertEqual(plan["ops"], [])
+        self.assertEqual([r["path"] for r in plan["refused"]], ["/E/UDATA/4d530064"])
+
+    def test_unparsed_list_line_warns(self):
+        fake = FakeXboxFTP()
+        orig = fake.retrlines
+
+        def odd(cmd, cb=None):
+            r = orig(cmd, cb)
+            cb("06-01-02  12:00PM  <DIR>  weird format")
+            return r
+        fake.retrlines = odd
+        c = client_for(fake)
+        c.list_dir("/E")
+        self.assertTrue(any("could not read a LIST line" in w for w in c.warnings))
+
+    def test_backup_leaves_existing_folder_mode(self):
+        c = client_for(FakeXboxFTP())
+        with tempfile.TemporaryDirectory() as d:
+            os.chmod(d, 0o755)
+            rep = ox.backup(c, d, [("eeprom", "/E/Backups/EEPROM")])
+            self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(os.stat(rep["root"]).st_mode), 0o700)
+            self.assertTrue(any("readable by other users" in w for w in rep["warnings"]))
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import struct
 import sys
 import time
@@ -107,7 +108,9 @@ def to_remote(path):
     does not start at a drive."""
     if not isinstance(path, str) or not path.strip():
         raise SafetyError("empty remote path")
-    p = path.strip().replace("\\", "/")
+    if path != path.strip():
+        raise SafetyError("remote path starts or ends with a space: %r" % path)
+    p = path.replace("\\", "/")
     m = re.match(r"^([A-Za-z]):(/.*)?$", p)
     if m:
         p = "/" + m.group(1).upper() + (m.group(2) or "")
@@ -177,6 +180,12 @@ def guard_write(path):
                           % (drive, path))
     if path.count("/") == 1:
         raise SafetyError("refusing to change a drive root (%s)" % path)
+    for comp in path.split("/")[2:]:
+        problems = fatx_name_problems(comp)
+        if problems:
+            # Also stops wildcards (*, ?) and trailing dots that a server
+            # might expand or strip into a different, protected target.
+            raise SafetyError("refusing %s: %s" % (path, "; ".join(problems)))
     return path
 
 
@@ -207,6 +216,20 @@ def protected_reason(path, extra_protected=(), protected_titles=()):
     if m and m.group(2) in protected_titles:
         return "title %s is still installed; its %s folder is kept" % (m.group(2), m.group(1).upper())
     return None
+
+
+def guard_create(path, extra_protected=()):
+    """mkdir and upload: never inside a protected folder (an upload could
+    overwrite an EEPROM backup or dashboard file)."""
+    path = guard_write(path)
+    for root in list(NEVER_DELETE) + [to_remote(p) for p in extra_protected]:
+        if is_within(path, root):
+            raise SafetyError("refusing to write inside %s (%s): it is protected" % (root, path))
+    for comp in path.lower().split("/")[1:]:
+        for prefix in NEVER_DELETE_COMPONENT_PREFIXES:
+            if comp.startswith(prefix):
+                raise SafetyError("refusing to write inside nkpatcher settings (%s)" % path)
+    return path
 
 
 def env_protected(environ=None):
@@ -397,6 +420,9 @@ class XboxFTP(object):
             e = parse_list_line(line)
             if e is not None:
                 entries.append(e)
+            elif line.strip() and not re.match(r"^total \d+$", line.strip()) \
+                    and not re.search(r"\s\.{1,2}$", line.rstrip()):
+                self.warn("could not read a LIST line in %s: %r" % (here, line[:80]))
         return here, entries
 
     def exists_dir(self, path):
@@ -521,7 +547,7 @@ class XboxFTP(object):
     # writes (every one guarded, one at a time, verified after) -------------
 
     def mkdir(self, remote):
-        remote = guard_write(remote)
+        remote = guard_create(remote, env_protected())
         with self._one_op():
             self.cd(remote_parent(remote))
             self.ftp.mkd(remote_name(remote))
@@ -529,9 +555,11 @@ class XboxFTP(object):
                 raise OgxError("verify failed: %s was not created" % remote)
 
     def upload(self, local, remote):
-        remote = guard_write(remote)
+        remote = guard_create(remote, env_protected())
         size = os.path.getsize(local)
         with self._one_op():
+            if self.stat_entry(remote) is not None:
+                raise SafetyError("refusing to overwrite %s; it already exists" % remote)
             self.cd(remote_parent(remote))
             self._binary()
             with open(local, "rb") as fh:
@@ -671,6 +699,14 @@ def check_fatx_tree(local_root, target_name=None):
     for dirpath, dirnames, filenames in os.walk(local_root):
         dirnames.sort()
         rel = os.path.relpath(dirpath, local_root)
+        seen = {}
+        for name in sorted(dirnames) + sorted(filenames):
+            key = name.lower()
+            if key in seen:
+                relname = name if rel == "." else os.path.join(rel, name).replace(os.sep, "/")
+                violations.append({"path": relname, "problem": "same name as %r apart from case; FATX "
+                                   "ignores case, so one would replace the other" % seen[key]})
+            seen[key] = name
         for name in sorted(dirnames) + sorted(filenames):
             relname = name if rel == "." else os.path.join(rel, name).replace(os.sep, "/")
             for p in fatx_name_problems(name):
@@ -695,26 +731,43 @@ def _find_child(entries, name, is_dir=None):
     return None
 
 
-def installed_games(client, drives=None, read_xbe=True, max_depth=DEFAULT_MAX_DEPTH):
-    """Folders with a default.xbe directly under <drive>/games."""
+GAME_SEARCH_DEPTH = 3  # games/<Game>, games/<Category>/<Game>, one more level
+
+
+def installed_games(client, drives=None, read_xbe=True, max_depth=GAME_SEARCH_DEPTH):
+    """Folders with a default.xbe under <drive>/games, up to `max_depth`
+    levels down (category folders are common). A game folder is not
+    searched further."""
     games = []
     for d in drives or GAME_DRIVES:
         root = "/%s/games" % d
         try:
-            _, entries = client.list_dir(root)
-        except ftplib.error_perm:
+            client.cd(root)
+        except (ftplib.error_perm, OgxError):
             continue
-        for e in sorted((e for e in entries if e["is_dir"]), key=lambda e: e["name"].lower()):
-            path = remote_join(root, e["name"])
+        stack = [(root, 0)]
+        seen = set()
+        while stack:
+            parent, depth = stack.pop()
             try:
-                _, inner = client.list_dir(path)
+                here, entries = client.list_dir(parent)
             except (ftplib.error_perm, OgxError) as exc:
-                client.warn("cannot open %s: %s" % (path, exc))
+                client.warn("cannot open %s: %s" % (parent, exc))
                 continue
-            xbe = _find_child(inner, "default.xbe", is_dir=False)
+            if here.lower() in seen:
+                continue
+            seen.add(here.lower())
+            xbe = _find_child(entries, "default.xbe", is_dir=False) if parent != root else None
             if xbe is None:
+                if depth < max_depth:
+                    for e in sorted((e for e in entries if e["is_dir"]), key=lambda e: e["name"].lower(),
+                                    reverse=True):
+                        stack.append((remote_join(here, e["name"]), depth + 1))
+                elif any(e["is_dir"] for e in entries):
+                    client.warn("games may sit deeper than %d levels under %s; not searched" % (max_depth, parent))
                 continue
-            game = {"path": path, "folder": e["name"], "title_id": None, "title_name": None}
+            path = here
+            game = {"path": path, "folder": remote_name(path), "title_id": None, "title_name": None}
             if read_xbe:
                 try:
                     info = parse_xbe(client.read_head(remote_join(path, xbe["name"])))
@@ -722,7 +775,18 @@ def installed_games(client, drives=None, read_xbe=True, max_depth=DEFAULT_MAX_DE
                 except (OgxError, ftplib.Error, OSError) as exc:
                     client.warn("could not read the title ID of %s: %s" % (path, exc))
             games.append(game)
+    games.sort(key=lambda g: g["path"].lower())
     return games
+
+
+def installed_title_ids(client):
+    """(title IDs of installed games, complete?). Not complete when any
+    game's title ID could not be read or part of a games folder could not
+    be searched: then no save or title data may be deleted."""
+    before = len(client.warnings)
+    games = installed_games(client, read_xbe=True)
+    complete = len(client.warnings) == before and all(g.get("title_id") for g in games)
+    return sorted({g["title_id"] for g in games if g.get("title_id")}), complete
 
 
 def inventory(client, max_depth=DEFAULT_MAX_DEPTH, read_xbe=True, titles=None):
@@ -821,8 +885,13 @@ def _inside_git(path):
 
 
 def _private_dir(path):
-    os.makedirs(path, mode=0o700, exist_ok=True)
+    """Create `path` owner-only. A folder that already exists is left as it
+    is (it may be the user's home); the backup folder inside is new."""
+    if os.path.isdir(path):
+        return False
+    os.makedirs(path, mode=0o700)
     os.chmod(path, 0o700)
+    return True
 
 
 def _private_file(path):
@@ -847,7 +916,9 @@ def backup(client, dest, sources=None, max_depth=DEFAULT_MAX_DEPTH):
     if repo:
         report["warnings"].append("this folder is inside a git repository (%s); keep it out of git" % repo)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    _private_dir(dest)
+    if not _private_dir(dest) and stat.S_IMODE(os.stat(dest).st_mode) & 0o077:
+        report["warnings"].append("%s is readable by other users; the backup folder inside it is "
+                                  "owner-only" % dest)
     root = os.path.join(dest, "ogxbox-backup-" + stamp)
     n = 1
     while os.path.exists(root):  # never mix two backups in one folder
@@ -962,8 +1033,7 @@ def plan_add_game(client, local_dir, drive="E", title=None):
 def plan_cleanup(client, targets, extra_protected=(), max_depth=DEFAULT_MAX_DEPTH):
     """Expand each named target into the exact files and folders to delete
     (deepest first). Protected paths are refused here and again at apply."""
-    games = installed_games(client, read_xbe=True)
-    protected_titles = sorted({g["title_id"] for g in games if g.get("title_id")})
+    protected_titles, complete = installed_title_ids(client)
     refused, ops, total = [], [], 0
     for t in targets:
         try:
@@ -972,6 +1042,9 @@ def plan_cleanup(client, targets, extra_protected=(), max_depth=DEFAULT_MAX_DEPT
             refused.append({"path": t, "why": str(exc)})
             continue
         why = protected_reason(t, extra_protected, protected_titles)
+        if not why and not complete and re.match(r"^/[a-z]/(udata|tdata)/", t.lower()):
+            why = ("the title IDs of the installed games could not all be read, so no save or title "
+                   "data is deleted (see the warnings)")
         if why:
             refused.append({"path": t, "why": why})
             continue
@@ -996,6 +1069,20 @@ def plan_cleanup(client, targets, extra_protected=(), max_depth=DEFAULT_MAX_DEPT
             refused.append({"path": t, "why": "the walk was incomplete (%s); nothing under it is planned"
                             % client.warnings[-1]})
             ops = [o for o in ops if not is_within(o["remote"], t)]
+            total = sum(o.get("bytes", 0) for o in ops)
+            continue
+        bad = None
+        for path in dirs + [o["remote"] for o in ops if is_within(o["remote"], t)]:
+            try:
+                guard_delete(path, extra_protected, protected_titles)
+            except SafetyError as exc:
+                bad = str(exc)
+                break
+        if bad:
+            refused.append({"path": t, "why": "it holds something protected (%s); nothing under it "
+                            "is planned" % bad})
+            ops = [o for o in ops if not is_within(o["remote"], t)]
+            total = sum(o.get("bytes", 0) for o in ops)
             continue
         for d in sorted(dirs, key=lambda p: p.count("/"), reverse=True):
             ops.append({"op": "rmdir", "remote": d})
@@ -1016,15 +1103,28 @@ def check_plan(plan):
         raise SafetyError("the plan has %d problem(s); fix them and plan again" % len(plan["violations"]))
     titles = plan.get("protected_titles") or []
     extra = plan.get("extra_protected") or []
+    if plan.get("kind") not in ("add-game", "cleanup"):
+        raise SafetyError("unknown plan kind %r" % plan.get("kind"))
     for op in plan.get("ops", []):
         kind = op.get("op")
+        if plan["kind"] == "cleanup" and kind not in ("delete", "rmdir"):
+            raise SafetyError("a cleanup plan only deletes")
+        if plan["kind"] == "add-game" and kind not in ("mkdir", "upload"):
+            raise SafetyError("an add-game plan never deletes")
         if kind in ("mkdir", "upload"):
-            guard_write(op["remote"])
+            remote = guard_create(op["remote"], extra)
+            games = "/%s/games" % drive_of(remote)
+            target = plan.get("target") or ""
+            if not (same_path(remote, games) or (target and is_within(remote, target)
+                                                  and same_path(remote_parent(to_remote(target)), games))):
+                raise SafetyError("an add-game plan only writes inside its target game folder: %s" % remote)
         elif kind in ("delete", "rmdir"):
             guard_delete(op["remote"], extra, titles)
         else:
             raise SafetyError("unknown operation %r" % kind)
         if kind == "upload":
+            if op.get("bytes", 0) > FATX_MAX_FILE or os.path.getsize(op["local"]) > FATX_MAX_FILE:
+                raise SafetyError("%s is larger than FATX allows" % op["local"])
             if not os.path.isfile(op["local"]):
                 raise SafetyError("local file is gone: %s" % op["local"])
             if os.path.getsize(op["local"]) != op["bytes"]:
@@ -1046,9 +1146,16 @@ def apply_plan(client, plan, approved_hash, yes=False, free_space_ok=False, log=
     done = []
     titles = list(plan.get("protected_titles") or [])
     extra = list(plan.get("extra_protected") or []) + env_protected()
-    if plan.get("kind") == "cleanup":
+    if any(op.get("op") in ("delete", "rmdir") for op in plan["ops"]):
         # Do not trust the plan file alone: ask the console again which games are installed.
-        titles += [g["title_id"] for g in installed_games(client) if g.get("title_id")]
+        live, complete = installed_title_ids(client)
+        titles += live
+        if not complete and any(re.match(r"^/[a-z]/(udata|tdata)/", op["remote"].lower())
+                                for op in plan["ops"]):
+            raise SafetyError("the title IDs of the installed games could not all be read; no save "
+                              "or title data is deleted")
+        for op in plan["ops"]:
+            guard_delete(op["remote"], extra, titles)
     for i, op in enumerate(plan["ops"], 1):
         kind, remote = op["op"], op["remote"]
         log("[%d/%d] %s %s" % (i, len(plan["ops"]), kind, remote))
@@ -1193,8 +1300,16 @@ def _emit(args, data, human):
         human(data)
 
 
-def _lock(path):
-    lock = path + ".lock"
+def lock_dir():
+    d = os.environ.get("OGXBOX_LOCK_DIR") or os.path.join(os.path.expanduser("~"), ".cache", "ogxbox")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+def _lock(settings):
+    """One apply per console at a time, across processes."""
+    key = hashlib.sha256(("%s:%d" % (settings.host.lower(), settings.port)).encode("utf-8")).hexdigest()[:16]
+    lock = os.path.join(lock_dir(), "apply-%s.lock" % key)
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
@@ -1277,7 +1392,7 @@ def main(argv=None, ftp_factory=None, environ=None):
                 _emit(args, {"plan": args.out, "hash": h, "content": plan}, lambda d: print_plan(plan, h))
                 return 1 if plan.get("violations") else 0
             elif args.cmd == "apply":
-                lock = _lock(args.plan)
+                lock = _lock(settings)
                 try:
                     res = apply_plan(c, plan, args.approve, yes=args.yes,
                                      free_space_ok=args.free_space_ok, log=log)

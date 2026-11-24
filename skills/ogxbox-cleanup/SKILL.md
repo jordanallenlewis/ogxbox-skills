@@ -24,7 +24,8 @@ description: 'Free space on a softmodded original Xbox by deleting folders or fi
 - `E:\Backups` and everything in it.
 - nkpatcher settings (any folder named nkpatcher...).
 - The dashboard: `E:\Dashboard`, `E:\Dashboards`, `E:\XBMC4Gamers`, and XBMC's P: and Q:.
-- The `UDATA` and `TDATA` folders themselves. A single save or title folder inside them can be deleted only when the user names it, and only if no installed game has that title ID (the helper reads the title ID from every installed `default.xbe`, when planning and again when applying).
+- The `UDATA` and `TDATA` folders themselves. A single save or title folder inside them can be deleted only when the user names it, and only if no installed game has that title ID (the helper reads the title ID from every installed `default.xbe`, including games in category folders like `E:\\games\\Shooters\\<Game>`, when planning and again when applying). If any installed game's title ID cannot be read, no save or title data is deleted at all.
+- A folder that holds anything on this list (for example an nkpatcher folder inside a save) is refused whole.
 - Drive roots.
 - Anything the user adds with `--protect PATH` or in `OGXBOX_PROTECT` (paths separated by `;`).
 
