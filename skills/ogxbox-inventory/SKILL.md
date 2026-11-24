@@ -19,6 +19,10 @@ Read-only. This skill never changes anything on the console.
 
 If the helper exits with `Console FTP not reachable: start XBMC4Gamers and enable its FTP server, then re-run.` (exit code 3), stop. Tell the user that message and nothing else. Do not retry, loop, or try other addresses: the helper has already tried three times, and the server can disappear across a reboot or a profile switch.
 
+What to tell the user alongside that message, if the dashboard is still on screen:
+
+    FTP refused while the dashboard is on: set the screensaver to Dim, restart XBMC4Gamers
+
 If a run ends with `INCOMPLETE` or exit code 4, the console stopped answering partway through. The result is partial: say so first, before anything else you report, and do not use it to decide a change (no add-game or cleanup from a partial list). Tell the user to start XBMC4Gamers, enable its FTP server and re-run.
 
 ## Steps

@@ -69,6 +69,10 @@ The FTP server can also disappear across a reboot or a profile switch. The helpe
 
 Drives appear as folders at the FTP root: `/C`, `/D` (DVD), `/E`, `/F` and `/G` (if partitioned), `/P` and `/Q` (XBMC profile and home). The helper checks which exist; a missing drive is not an error.
 
+## Troubleshooting
+
+**FTP is refused, or stops answering, while the XBMC4Gamers dashboard is still on screen.** Cause: the Planestate 3D screensaver. On one 64 MB console the built-in FTP server (`XBMC:FileZilla 1.5.6`) went from up, to unresponsive, to refused 18 minutes into idle with that screensaver running. Fix: in XBMC4Gamers settings, set the screensaver to Dim with a long timeout. With that setting the same console stayed up for 41+ minutes idle. Recovery: restart XBMC4Gamers. Once the FTP server has crashed it does not come back by itself. This is one console and one observation, not a tested rule.
+
 ## Title IDs
 
 Saves and title data live in folders named after a game's title ID, like `E:\UDATA\4d530004`. Names come from three places, in this order:
